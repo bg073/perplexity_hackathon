@@ -6,10 +6,10 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { truncate, formatDate } from '../../lib/utils';
 
 interface SidebarProps {
-  sidebarCollapsed: boolean;
+  isMobile?: boolean;
 }
 
-const Sidebar: React.FC<SidebarProps> = ({ sidebarCollapsed }) => {
+const Sidebar: React.FC<SidebarProps> = ({ isMobile = false }) => {
   const { 
     conversations, 
     activeConversationId, 
@@ -17,7 +17,6 @@ const Sidebar: React.FC<SidebarProps> = ({ sidebarCollapsed }) => {
     createNewConversation,
     sidebarOpen,
     setSidebarOpen,
-    deleteConversation,
   } = useChatStore();
 
   // Sort conversations with most recent updates first
@@ -25,41 +24,43 @@ const Sidebar: React.FC<SidebarProps> = ({ sidebarCollapsed }) => {
     (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime()
   );
 
+  if (isMobile && !sidebarOpen) return null;
+
   return (
     <AnimatePresence>
       {sidebarOpen && (
         <motion.aside
-          className={
-            `bg-card border-r border-border fixed inset-0 z-50 w-full h-full transition-all duration-300 md:static md:h-full md:flex md:flex-shrink-0
-            ${sidebarCollapsed ? 'md:w-16' : 'md:w-1/4 md:max-w-xs md:min-w-[220px]'}
-            `
-          }
-          initial={{ x: '-100%' }}
-          animate={{ x: 0 }}
-          exit={{ x: '-100%' }}
+          className={`bg-card border-r border-border ${
+            isMobile 
+              ? 'fixed inset-0 z-50' 
+              : 'w-1/4 max-w-xs min-w-[220px] hidden md:flex flex-shrink-0'
+          }`}
+          initial={isMobile ? { x: '-100%' } : { opacity: 1 }}
+          animate={isMobile ? { x: 0 } : { opacity: 1 }}
+          exit={isMobile ? { x: '-100%' } : { opacity: 1 }}
           transition={{ duration: 0.2, ease: 'easeInOut' }}
         >
           <div className="flex flex-col h-full">
-            {/* Mobile close button */}
-            <div className="flex justify-end p-2 md:hidden">
-              <Button 
-                variant="ghost" 
-                size="icon"
-                onClick={() => setSidebarOpen(false)}
-                aria-label="Close sidebar"
-              >
-                <X className="h-5 w-5" />
-              </Button>
-            </div>
+            {isMobile && (
+              <div className="flex justify-end p-2">
+                <Button 
+                  variant="ghost" 
+                  size="icon"
+                  onClick={() => setSidebarOpen(false)}
+                >
+                  <X className="h-5 w-5" />
+                </Button>
+              </div>
+            )}
             
             <div className="p-4">
               <Button
                 variant="gradient"
-                className={`w-full justify-start gap-2 ${sidebarCollapsed ? 'md:justify-center' : ''}`}
+                className="w-full justify-start gap-2"
                 onClick={createNewConversation}
               >
                 <Plus className="h-4 w-4" />
-                {!sidebarCollapsed && <span>New Chat</span>}
+                New Chat
               </Button>
             </div>
             
