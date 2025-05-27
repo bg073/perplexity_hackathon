@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fact-Checking Web App (Sonar API, Python, No Backend)</title>
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.24.1/full/pyodide.js"></script>
+    <script src="https://unpkg.com/3d-force-graph"></script>
+    <style>
+        body { 
+            font-family: Arial, sans-serif; 
+            margin: 40px; 
+            background: #f7f7f7; 
+        }
+        .container { 
+            background: #fff; 
+            padding: 2rem; 
+            border-radius: 8px; 
+            max-width: 700px; 
+            margin: auto; 
+            box-shadow: 0 2px 8px rgba(0,0,0,0.12); 
+        }
+        textarea { 
+            width: 100%; 
+            height: 120px; 
+            font-size: 1rem; 
+            padding: 10px; 
+            border-radius: 4px; 
+            border: 1px solid #ccc; 
+            box-sizing: border-box;
+        }
+        button { 
+            padding: 10px 20px; 
+            background: #007bff; 
+            color: #fff; 
+            border: none; 
+            border-radius: 4px; 
+            font-size: 1rem; 
+            cursor: pointer; 
+            margin-top: 10px; 
+            margin-right: 10px;
+        }
+        button:disabled { 
+            background: #aaa; 
+            cursor: not-allowed;
+        }
+        button:hover:not(:disabled) {
+            background: #0056b3;
+        }
+        #result { 
+            margin-top: 2rem; 
+        }
+        #tree { 
+            margin-top: 2rem; 
+        }
+        #tree3d {
+            height: 500px; 
+            margin-top: 2rem;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        pre {
+            background: #f8f9fa;
+            padding: 1rem;
+            border-radius: 4px;
+            overflow-x: auto;
+            white-space: pre-wrap;
+        }
+        .analysis-nav {
+            margin: 1rem 0;
+        }
+        .sentiment-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.9em;
+            color: white;
+            margin: 0 4px;
+        }
+        .error {
+            color: #e53935;
+            background: #ffebee;
+            padding: 1rem;
+            border-radius: 4px;
+        }
+        .loading {
+            color: #1976d2;
+            font-style: italic;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Fact-Checking & Incident Investigation Web App</h2>
+        <p>Enter either a link to a news article <b>or</b> paste a description of an incident/event.<br>
+        All analysis is done in your browser using Python (Pyodide) and spaCy NLP.<br>
+        <small>spaCy runs in-browser thanks to <a href='https://pyodide.org/' target='_blank'>Pyodide</a> (Python compiled to WebAssembly).</small></p>
+        
+        <textarea id="inputBox" placeholder="Paste article URL or describe an incident/event here..."></textarea>
+        <button id="analyzeBtn">Analyze</button>
+        
+        <div id="result"></div>
+        <div id="tree"></div>
+        <div id="tree3d"></div>
+    </div>
+
+    <script>
+        // Global variables
+        let pyodideNLP = null;
+        let currentAnalysisIndex = 0;
+        let allAnalyses = [];
+
+        // Utility functions
+        function getSentiment(text) {
+            const pos = ['good','excellent','positive','successful','happy','improved','beneficial','peaceful','safe','trustworthy'];
+            const neg = ['bad','negative','failed','angry','fear','danger','harm','controversial','problem','risk','biased','untrustworthy'];
+            let score = 0;
+            let lc = text.toLowerCase();
+            pos.forEach(w => { if(lc.includes(w)) score++; });
+            neg.forEach(w => { if(lc.includes(w)) score--; });
+            if (score > 0) return {label:'Positive', color:'#4caf50'};
+            if (score < 0) return {label:'Negative', color:'#e53935'};
+            return {label:'Neutral', color:'#607d8b'};
+        }
+
+        function getEmotion(text) {
+            const emotions = [
+                {label:'Angry', color:'#ff9800', words:['angry','furious','outraged','rage']},
+                {label:'Fearful', color:'#9c27b0', words:['afraid','fear','scared','panic','worry']},
+                {label:'Hopeful', color:'#2196f3', words:['hope','optimistic','confident']},
+                {label:'Sad', color:'#607d8b', words:['sad','disappointed','tragic','loss']}
+            ];
+            let lc = text.toLowerCase();
+            for (let em of emotions) {
+                if (em.words.some(w => lc.includes(w))) return em;
+            }
+            return {label:'Neutral', color:'#607d8b'};
+        }
+
+        function getIntent(text) {
+            const intents = [
+                {label:'Inform', color:'#2196f3', words:['inform','report','describe','explain','state']},
+                {label:'Persuade', color:'#ffb300', words:['convince','persuade','urge','recommend','call for','encourage']},
+                {label:'Warn', color:'#e53935', words:['warn','alert','caution','threat']},
+                {label:'Criticize', color:'#ab47bc', words:['criticize','blame','fault','accuse','denounce']},
+                {label:'Support', color:'#43a047', words:['support','endorse','back','defend']}
+            ];
+            let lc = text.toLowerCase();
+            for (let it of intents) {
+                if (it.words.some(w => lc.includes(w))) return it;
+            }
+            return {label:'Inform', color:'#2196f3'};
+        }
+
+        // API call function
+        async function callSonarAPI(prompt) {
+            const apiKey = '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';
+            const apiUrl = 'https://api.perplexity.ai/chat/completions';
+            const requestBody = {
+                model: "sonar",
+                messages: [
+                    {"role": "system", "content": "You are a fact-checking and information extraction assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens: 1024,
+                temperature: 0.2
+            };
+
+            const response = await fetch(apiUrl, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${apiKey}`
+                },
+                body: JSON.stringify(requestBody)
+            });
+
+            if (!response.ok) {
+                throw new Error('API error: ' + response.status);
+            }
+
+            return await response.json();
+        }
+
+        // Handle Sonar API response for URL analysis
+        function handleSonarReply(data) {
+            let reply = '';
+            if (data.choices && data.choices.length > 0) {
+                reply = data.choices[0].message.content;
+            } else {
+                reply = JSON.stringify(data);
+            }
+
+            // Parse the reply for sections
+            const analysisMatch = reply.match(/Fact-?checking analysis:?([\s\S]*?)(Entities:|List of entities:|Relationships:|$)/i);
+            const entitiesMatch = reply.match(/(Entities:|List of entities:)([\s\S]*?)(Relationships:|Causal timeline:|Reasoning tree:|$)/i);
+            const relationshipsMatch = reply.match(/Relationships:([\s\S]*?)(Causal timeline:|Reasoning tree:|$)/i);
+            const timelineMatch = reply.match(/(Causal timeline:|Reasoning tree:)([\s\S]*)/i);
+
+            let html = '';
+            if (analysisMatch) {
+                html += `<h3>Fact-Checking Analysis</h3><pre>${analysisMatch[1].trim()}</pre>`;
+            }
+            if (entitiesMatch) {
+                html += `<h3>Entities</h3><pre>${entitiesMatch[2].trim()}</pre>`;
+            }
+            if (relationshipsMatch) {
+                html += `<h3>Relationships</h3><pre>${relationshipsMatch[1].trim()}</pre>`;
+            }
+            if (timelineMatch) {
+                html += `<h3>Timeline / Reasoning Tree</h3><pre>${timelineMatch[2].trim()}</pre>`;
+            }
+            if (!html) {
+                html = `<pre>${reply}</pre>`;
+            }
+
+            document.getElementById('result').innerHTML = html;
+            buildReasoningTree(relationshipsMatch ? relationshipsMatch[1].trim() : '');
+        }
+
+        // Build reasoning tree from relationships
+        function buildReasoningTree(relationshipsText) {
+            let edges = [];
+            
+            if (relationshipsText) {
+                let lines = relationshipsText.split('\n');
+                for (let line of lines) {
+                    let match = line.match(/(.+?)(?:caused|led to|influenced|->|→)(.+)/i);
+                    if (match) {
+                        let parent = match[1].trim();
+                        let child = match[2].trim();
+                        edges.push([parent, child]);
+                    }
+                }
+            }
+
+            if (edges.length === 0) {
+                document.getElementById('tree').innerHTML = '<p>No causal relationships found to build reasoning tree.</p>';
+                return;
+            }
+
+            // Build tree structure
+            let nodes = {};
+            let children = new Set();
+            
+            for (let [parent, child] of edges) {
+                if (!nodes[parent]) nodes[parent] = { name: parent, children: [] };
+                if (!nodes[child]) nodes[child] = { name: child, children: [] };
+                nodes[parent].children.push(nodes[child]);
+                children.add(child);
+            }
+
+            // Find root nodes (nodes that are never children)
+            let roots = Object.values(nodes).filter(n => !children.has(n.name));
+
+            // Render tree
+            let treeHtml = '<h3>Reasoning Tree</h3>';
+            if (roots.length > 0) {
+                treeHtml += '<pre>';
+                for (let root of roots) {
+                    treeHtml += renderTreeNode(root, 0, true);
+                }
+                treeHtml += '</pre>';
+
+                // Add narrative
+                treeHtml += '<h3>Causal Narrative</h3><ul>';
+                for (let root of roots) {
+                    let narratives = buildNarrative(root, [], true);
+                    for (let narrative of narratives) {
+                        treeHtml += '<li>' + narrative + '</li>';
+                    }
+                }
+                treeHtml += '</ul>';
+            } else {
+                treeHtml += '<p>No clear root causes identified.</p>';
+            }
+
+            document.getElementById('tree').innerHTML = treeHtml;
+        }
+
+        // Render tree node recursively
+        function renderTreeNode(node, depth = 0, isRoot = false) {
+            let s = '  '.repeat(depth) + (isRoot ? '🌱 ' : '- ') + node.name + '\n';
+            for (let child of node.children) {
+                s += renderTreeNode(child, depth + 1);
+            }
+            return s;
+        }
+
+        // Build narrative from tree
+        function buildNarrative(node, path = [], isRoot = false) {
+            let narratives = [];
+            let newPath = [...path, node.name];
+            
+            if (node.children.length === 0) {
+                let narrative = (isRoot ? '<b>Root cause:</b> ' : '') + 
+                               'Because ' + newPath.slice(0, -1).join(' → ') + 
+                               (newPath.length > 1 ? ', ' : '') + node.name + ' happened.';
+                narratives.push(narrative);
+            } else {
+                for (let child of node.children) {
+                    narratives = narratives.concat(buildNarrative(child, newPath));
+                }
+            }
+            return narratives;
+        }
+
+        // Load Pyodide for NLP processing
+        async function loadPyodideNLP() {
+            if (!pyodideNLP) {
+                pyodideNLP = await loadPyodide({ indexURL: "https://cdn.jsdelivr.net/pyodide/v0.24.1/full/" });
+                await pyodideNLP.loadPackage('micropip');
+                await pyodideNLP.runPythonAsync(`import micropip; await micropip.install('spacy')`);
+                await pyodideNLP.runPythonAsync(`import spacy; spacy.cli.download('en_core_web_sm')`);
+                await pyodideNLP.runPythonAsync(`import spacy; nlp = spacy.load('en_core_web_sm')`);
+            }
+            return pyodideNLP;
+        }
+
+        // Function to parse relationships from Sonar's "Relationships Between Entities" section
+        function parseSonarRelationships(sonarContent) {
+            const relationships = [];
+            const sectionHeader = "## Relationships Between Entities";
+            
+            let headerStartIndex = sonarContent.indexOf(sectionHeader);
+            if (headerStartIndex === -1) {
+                 console.warn("Sonar relationship section header ('## Relationships Between Entities') not found.");
+                 return [];
+            }
+            var effectiveHeaderLength = sectionHeader.length;
+
+            let relationshipText = sonarContent.substring(headerStartIndex + effectiveHeaderLength);
+            
+            // Try to find the next ## section to limit the scope of relationshipText
+            const nextSectionRegex = /^\s*##\s+.*$/m; 
+            const nextSectionMatch = relationshipText.match(nextSectionRegex);
+            
+            if (nextSectionMatch) {
+                relationshipText = relationshipText.substring(0, nextSectionMatch.index);
+            }
+
+            const lines = relationshipText.split(/\r?\n/);
+            
+            for (const line of lines) {
+                const trimmedLine = line.trim();
+                if (trimmedLine.startsWith('- ') || trimmedLine.startsWith('* ')) {
+                    let relLineContent = trimmedLine.substring(2).trim(); 
+                    
+                    // Expecting **Subject** Relation **Object**
+                    const parts = relLineContent.split('**');
+                    // parts will be like ["", "Subject", " Relation ", "Object", " any trailing text"]
+                    
+                    if (parts.length >= 4 && parts[0] === "") { // Check for at least **S** R **O** structure
+                        const subj = parts[1].trim();
+                        const relation = parts[2].trim();
+                        const obj = parts[3].trim();
+
+                        if (subj && obj && relation) {
+                            relationships.push([subj, relation, obj]);
+                        } else if (subj && obj && !relation) {
+                            relationships.push([subj, "is related to", obj]);
+                        }
+                    } else {
+                        // Fallback for lines not strictly matching **S**R**O** but might have two bolded entities
+                        const firstBoldEnd = relLineContent.indexOf('**', 2); 
+                        if (firstBoldEnd === -1) continue; 
+                        const subjFallback = relLineContent.substring(2, firstBoldEnd);
+                        
+                        let lastBoldStartSearch = firstBoldEnd + 2;
+                        let lastBoldStartIndex = -1;
+                        let tempIndex = -1;
+                        
+                        while((tempIndex = relLineContent.indexOf('**', lastBoldStartSearch)) !== -1) {
+                            lastBoldStartIndex = tempIndex;
+                            lastBoldStartSearch = tempIndex + 2;
+                        }
+
+                        if (lastBoldStartIndex === -1 || lastBoldStartIndex <= firstBoldEnd) continue; 
+
+                        const lastBoldEnd = relLineContent.indexOf('**', lastBoldStartIndex + 2);
+                        if (lastBoldEnd === -1) continue; 
+
+                        const objFallback = relLineContent.substring(lastBoldStartIndex + 2, lastBoldEnd);
+                        
+                        let relationFallback = relLineContent.substring(firstBoldEnd + 2, lastBoldStartIndex).trim();
+                        relationFallback = relationFallback.replace(/^['":,\s]+|['":,\s]+$/g, "").trim();
+                        relationFallback = relationFallback.replace(/\s+/g, ' '); 
+
+                        if (subjFallback && objFallback && relationFallback) {
+                            relationships.push([subjFallback, relationFallback, objFallback]);
+                        } else if (subjFallback && objFallback && !relationFallback) { 
+                             relationships.push([subjFallback, "is related to", objFallback]);
+                        }
+                    }
+                }
+            }
+            if (relationships.length > 0) {
+                console.log("Successfully parsed Sonar relationships:", relationships);
+            } else {
+                console.warn("Could not parse any relationships from Sonar's 'Relationships Between Entities' section.");
+            }
+            return relationships;
+        }
+
+        // Function to extract SVO relationships using spaCy (Pyodide)
+        async function extractSVORelationships(text) {
+            const pyodide = await loadPyodideNLP();
+            
+            let svoResult = await pyodide.runPythonAsync(`
+import spacy
+nlp = spacy.load('en_core_web_sm')
+doc = nlp('''${text.replace(/'/g, "''")}''')
+svos = []
+for sent in doc.sents:
+    subj = None
+    obj = None
+    verb = None
+    for token in sent:
+        if 'subj' in token.dep_:
+            subj = token.text
+        if 'obj' in token.dep_:
+            obj = token.text
+        if token.pos_ == 'VERB':
+            verb = token.lemma_
+    if subj and verb and obj:
+        svos.append((subj, verb, obj))
+svos
+            `);
+            
+            let svos = [];
+            try {
+                svos = JSON.parse(svoResult.replace(/'/g, '"'));
+            } catch {
+                // Fallback parsing
+                svos = svoResult.match(/\(([^\)]+)\)/g)?.map(s => 
+                    s.replace(/[()']/g,'').split(',').map(x => x.trim())
+                ) || [];
+            }
+            
+            return svos;
+        }
+
+        // Render analysis navigation
+        function renderAnalysis(index) {
+            if (allAnalyses.length === 0) return;
+            
+            let analysis = allAnalyses[index];
+            let html = `<h3>Incident Relationship Analyses (${index + 1} of ${allAnalyses.length})</h3>`;
+            
+            if (analysis.error) {
+                html += `<div class="error"><b>${analysis.svo.join(' ')}</b>: ${analysis.error}</div>`;
+            } else {
+                html += `<div><b>${analysis.svo.join(' ')}</b>:<br>${analysis.content}</div>`;
+                if (analysis.sentiment) {
+                    html += `<div style="margin-top: 1rem;">
+                        <span class="sentiment-badge" style="background-color: ${analysis.sentiment.color}">
+                            Sentiment: ${analysis.sentiment.label}
+                        </span>
+                        <span class="sentiment-badge" style="background-color: ${analysis.emotion.color}">
+                            Emotion: ${analysis.emotion.label}
+                        </span>
+                        <span class="sentiment-badge" style="background-color: ${analysis.intent.color}">
+                            Intent: ${analysis.intent.label}
+                        </span>
+                    </div>`;
+                }
+            }
+            
+            html += `<div class="analysis-nav">`;
+            if (index > 0) {
+                html += `<button onclick="renderAnalysis(${index - 1})">Previous</button>`;
+            }
+            if (index < allAnalyses.length - 1) {
+                html += `<button onclick="renderAnalysis(${index + 1})">Next</button>`;
+            }
+            html += `</div>`;
+            
+            if (index === allAnalyses.length - 1) {
+                html += `<hr><div id="finalEstimation"><b>Generating final estimation...</b></div>`;
+                setTimeout(() => generateFinalEstimation(), 500);
+            }
+            
+            document.getElementById('result').innerHTML = html;
+        }
+
+        // Generate final estimation
+        function generateFinalEstimation() {
+            let allText = allAnalyses.map(a => a.content || '').join('\n');
+            
+            // Root cause analysis
+            let rootCause = '';
+            let becauseMatch = allText.match(/because ([^.]+)\./i) || 
+                             allText.match(/due to ([^.]+)\./i) || 
+                             allText.match(/as a result[^.]*\./i);
+            if (becauseMatch) rootCause = becauseMatch[0];
+            
+            // Timeline extraction
+            let timeline = [];
+            let dateRegex = /(\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?|\d{4}|\d{1,2}\/\d{1,2}\/\d{2,4}|\d{1,2}-\d{1,2}-\d{2,4})\b)/gi;
+            let events = allText.split(/\n|\./).filter(line => dateRegex.test(line));
+            timeline = events.map(e => e.trim()).filter(e => e);
+            
+            // Bias/Trust analysis
+            let biasWords = ['clearly','obviously','undoubtedly','supposedly','allegedly','reportedly','claimed','opinion','believe','think','biased','unsubstantiated','controversial','disputed','unverified'];
+            let biasCount = biasWords.reduce((acc, w) => acc + (allText.toLowerCase().includes(w) ? 1 : 0), 0);
+            let trustScore = Math.max(0, 100 - biasCount * 15 - (allAnalyses.filter(a => a.error).length * 20));
+            
+            let biasText = biasCount > 0 ? `Potential bias detected (${biasCount} subjective/adversarial terms).` : 'No strong bias detected.';
+            let trustText = trustScore > 80 ? 'Highly trustworthy.' : trustScore > 60 ? 'Moderately trustworthy.' : 'Low trust.';
+            
+            let summaryHtml = `<h3>Final Estimation</h3>
+                <b>Root Cause:</b> ${rootCause || 'Not clearly identified.'}<br>
+                <b>Timeline:</b> ${timeline.length ? timeline.join(' → ') : 'Not enough data.'}<br>
+                <b>Bias/Trust Analysis:</b> ${biasText}<br>
+                <b>Trust Score:</b> <span style='font-size:1.5em;font-weight:bold;'>${trustScore}</span> / 100<br>
+                <b>Trust Assessment:</b> ${trustText}<br>`;
+            
+            document.getElementById('finalEstimation').innerHTML = summaryHtml;
+        }
+
+        // Update 3D graph
+        function update3DGraph(graphData) {
+            if (window.ForceGraph3D && document.getElementById('tree3d')) {
+                let Graph = window.ForceGraph3D()(document.getElementById('tree3d'));
+                Graph.graphData(graphData)
+                    .nodeLabel(n => `${n.label}\nSentiment: ${n.group}\nEmotion: ${n.emotion}\nIntent: ${n.intent}`)
+                    .nodeColor(n => n.trust ? n.color : '#bdbdbd')
+                    .linkLabel(l => l.label)
+                    .linkColor(l => l.trust ? '#2196f3' : '#e53935')
+                    .linkOpacity(0.7)
+                    .onNodeClick(node => {
+                        alert(`Entity: ${node.label}\nSentiment: ${node.group}\nEmotion: ${node.emotion}\nIntent: ${node.intent}`);
+                    });
+            }
+        }
+
+        // Main analyze button event handler
+        document.getElementById('analyzeBtn').onclick = async function() {
+            const input = document.getElementById('inputBox').value.trim();
+            const resultDiv = document.getElementById('result');
+            const treeDiv = document.getElementById('tree');
+            
+            // Clear previous results
+            resultDiv.innerHTML = '';
+            treeDiv.innerHTML = '';
+            document.getElementById('tree3d').innerHTML = '';
+            
+            if (!input) {
+                resultDiv.innerHTML = '<div class="error">Please enter a URL or incident/event description.</div>';
+                return;
+            }
+            
+            // Disable button during processing
+            document.getElementById('analyzeBtn').disabled = true;
+            resultDiv.innerHTML = '<div class="loading">Analyzing input using Sonar API...</div>';
+            
+            try {
+                // STEP 1: Send initial input to Sonar API for high-level analysis
+                // Detect if input is a URL for prompt customization
+                const urlPattern = /^(https?:\/\/)?(([\w\d-]+\.)+[\w\d]{2,})(\/\S*)?$/;
+                const isUrl = urlPattern.test(input);
+                
+                // Create a unified prompt that works for both URLs and text
+                let initialPrompt = isUrl ?
+                    `Please analyze the article at this URL: ${input}\nProvide:\n1) A casual explanation of what happened\n2) List all entities involved (people, organizations, places, events)\n3) At the end, list all relationships between entities in the format: **Entity1** relation **Entity2**` :
+                    `Please analyze this incident/event description: """${input}"""\nProvide:\n1) A casual explanation of what happened\n2) List all entities involved (people, organizations, places, events)\n3) At the end, list all relationships between entities in the format: **Entity1** relation **Entity2**`;
+                
+                // Send to Sonar API for initial analysis
+                let sonarData;
+                try {
+                    sonarData = await callSonarAPI(initialPrompt);
+                } catch (err) {
+                    resultDiv.innerHTML = `<div class="error">Error calling Sonar API: ${err.message}</div>`;
+                    document.getElementById('analyzeBtn').disabled = false;
+                    return;
+                }
+                
+                // Extract content from Sonar response
+                let content = '';
+                if (sonarData.choices && sonarData.choices.length > 0) {
+                    content = sonarData.choices[0].message.content;
+                } else {
+                    content = JSON.stringify(sonarData);
+                }
+                
+                // STEP 2: Extract relationships locally from Sonar's response
+                resultDiv.innerHTML = '<div class="loading">Extracting relationships from Sonar response...</div>';
+                
+                // First try to parse the structured relationships section
+                let svos = parseSonarRelationships(content);
+                
+                // If no relationships found in structured section, try spaCy
+                if (!svos || svos.length === 0) {
+                    resultDiv.innerHTML = '<div class="loading">No structured relationships found. Using spaCy for extraction...</div>';
+                    svos = await extractSVORelationships(content);
+                }
+                
+                if (!svos || svos.length === 0) {
+                    resultDiv.innerHTML = '<div class="error">No relationships found in the article/incident. Cannot build reasoning tree.</div>';
+                    document.getElementById('analyzeBtn').disabled = false;
+                    return;
+                }
+                
+                resultDiv.innerHTML = `<div class="loading">Found <b>${svos.length}</b> relationships. Analyzing each in detail...</div>`;
+                    
+                // STEP 3: Send focused queries to Sonar for each relationship
+                allAnalyses = [];
+                for (let [subj, verb, obj] of svos) {
+                    // Create a focused prompt for this specific relationship
+                    let relPrompt = `Given this relationship from ${isUrl ? 'the article' : 'the incident description'}: "${subj} ${verb} ${obj}", please provide:
+1) What exactly happened between these entities
+2) Any causal links or motivations
+3) How this relationship affects the overall situation
+4) Any evidence supporting or contradicting this relationship`;
+                    
+                    try {
+                        const data = await callSonarAPI(relPrompt);
+                        let content = '';
+                        if (data.choices && data.choices.length > 0) {
+                            content = data.choices[0].message.content;
+                        } else {
+                            content = JSON.stringify(data);
+                        }
+                        
+                        let sentiment = getSentiment(content);
+                        let emotion = getEmotion(content);
+                        let intent = getIntent(content);
+                        
+                        allAnalyses.push({
+                            svo: [subj, verb, obj],
+                            content: content,
+                            sentiment: sentiment,
+                            emotion: emotion,
+                            intent: intent
+                        });
+                    } catch (err) {
+                        allAnalyses.push({
+                            svo: [subj, verb, obj],
+                            error: err.message,
+                            sentiment: {label:'Neutral', color:'#607d8b'},
+                            emotion: {label:'Neutral', color:'#607d8b'},
+                            intent: {label:'Inform', color:'#2196f3'}
+                        });
+                    }
+                    }
+                    
+                // STEP 4: Build reasoning tree locally and visualize the results
+                // Build graph data for 3D visualization
+                let graphNodes = {};
+                let graphLinks = [];
+                
+                allAnalyses.forEach((a, i) => {
+                    let [subj, verb, obj] = a.svo;
+                    let sentiment = a.sentiment || {label:'Neutral', color:'#607d8b'};
+                    let emotion = a.emotion || {label:'Neutral', color:'#607d8b'};
+                    let intent = a.intent || {label:'Inform', color:'#2196f3'};
+                    
+                    if (!graphNodes[subj]) {
+                        graphNodes[subj] = {
+                            id: subj,
+                            label: subj,
+                            group: sentiment.label,
+                            color: sentiment.color,
+                            emotion: emotion.label,
+                            intent: intent.label,
+                            trust: !a.error
+                        };
+                    }
+                    if (!graphNodes[obj]) {
+                        graphNodes[obj] = {
+                            id: obj,
+                            label: obj,
+                            group: sentiment.label,
+                            color: sentiment.color,
+                            emotion: emotion.label,
+                            intent: intent.label,
+                            trust: !a.error
+                        };
+                    }
+                    
+                    graphLinks.push({
+                        source: subj,
+                        target: obj,
+                        label: verb,
+                        idx: i,
+                        trust: !a.error
+                    });
+                });
+                
+                let graphData = {
+                    nodes: Object.values(graphNodes),
+                    links: graphLinks
+                };
+                
+                // Show first analysis
+                currentAnalysisIndex = 0;
+                renderAnalysis(0);
+                
+                // Update 3D graph
+                setTimeout(() => update3DGraph(graphData), 500);
+                
+                // Generate final estimation
+                setTimeout(() => generateFinalEstimation(), 1000);
+                
+            } catch (error) {
+                resultDiv.innerHTML = `<div class="error">Error: ${error.message}</div>`;
+            } finally {
+                // Re-enable button
+                document.getElementById('analyzeBtn').disabled = false;
+            }
+        };
+
+        // Make renderAnalysis globally accessible
+        window.renderAnalysis = renderAnalysis;
+    </script>
+</body>
+</html>
